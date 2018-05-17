@@ -949,7 +949,6 @@ static int seg6_local_build_state(struct nlattr *nla, unsigned int family,
 
 	err = nla_parse_nested(tb, SEG6_LOCAL_MAX, nla, seg6_local_policy,
 			       extack);
-
 	if (err < 0)
 		return err;
 
