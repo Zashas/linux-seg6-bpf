@@ -2065,7 +2065,8 @@ union bpf_attr {
 	FN(lwt_push_encap),		\
 	FN(lwt_seg6_store_bytes),	\
 	FN(lwt_seg6_adjust_srh),	\
-	FN(lwt_seg6_action),
+	FN(lwt_seg6_action),		\
+	FN(ipv6_fib_multipath_nh),
 
 /* integer value in 'imm' field of BPF_CALL instruction selects which helper
  * function eBPF program intends to call

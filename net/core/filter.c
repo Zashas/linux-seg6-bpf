@@ -4545,6 +4545,81 @@ static const struct bpf_func_proto bpf_lwt_seg6_adjust_srh_proto = {
 	.arg3_type	= ARG_ANYTHING,
 };
 
+BPF_CALL_5(bpf_ipv6_fib_multipath_nh, struct sk_buff *, skb, struct in6_addr *,
+	   dst, int, dst_len, void *, buf, int, buf_len)
+{
+#if IS_ENABLED(CONFIG_IPV6)
+	struct fib6_info *f6i, *sibling, *next_sibling;
+	struct net *net = dev_net(skb->dev);
+	struct flowi6 fl6;
+	int nb_nh = 0;
+
+	if (dst_len != sizeof(struct in6_addr))
+		return -EINVAL;
+
+	if (buf_len < sizeof(struct in6_addr) ||
+	    buf_len % sizeof(struct in6_addr) != 0)
+		return -EINVAL;
+
+	/* link local addresses are never forwarded */
+	if (rt6_need_strict(dst))
+		return 0;
+
+	memset(&fl6, 0, sizeof(fl6));
+	fl6.daddr = *dst;
+	fl6.flowi6_uid = sock_net_uid(net, NULL);
+
+	f6i = ipv6_stub->fib6_lookup(net, 0, &fl6, 0);
+
+	if (unlikely(IS_ERR_OR_NULL(f6i) || f6i == net->ipv6.fib6_null_entry))
+		return 0;
+
+	if (unlikely(f6i->fib6_flags & RTF_REJECT ||
+	    f6i->fib6_type != RTN_UNICAST))
+		return 0;
+
+	if (f6i->fib6_flags & RTF_GATEWAY) {
+		memcpy(buf + nb_nh * sizeof(struct in6_addr),
+		       &f6i->fib6_nh.nh_gw, sizeof(struct in6_addr));
+		nb_nh++;
+	}
+
+	if (f6i->fib6_nsiblings) {
+		list_for_each_entry_safe(sibling, next_sibling, &f6i->fib6_siblings,
+					 fib6_siblings) {
+			if (unlikely(f6i->fib6_flags & RTF_REJECT ||
+			    f6i->fib6_type != RTN_UNICAST))
+				continue;
+
+			if (nb_nh >= buf_len / sizeof(struct in6_addr))
+				break;
+
+			if (sibling->fib6_flags & RTF_GATEWAY) {
+				memcpy(buf + nb_nh * sizeof(struct in6_addr),
+				       &sibling->fib6_nh.nh_gw,
+				       sizeof(struct in6_addr));
+				nb_nh++;
+			}
+		}
+	}
+
+	return nb_nh;
+#else /* CONFIG_IPV6 */
+	return -EOPNOTSUPP;
+#endif
+}
+
+static const struct bpf_func_proto bpf_ipv6_fib_multipath_nh_proto = {
+	.func		= bpf_ipv6_fib_multipath_nh,
+	.gpl_only	= true,
+	.ret_type	= RET_INTEGER,
+	.arg1_type      = ARG_PTR_TO_CTX,
+	.arg2_type	= ARG_PTR_TO_UNINIT_MEM,
+	.arg3_type      = ARG_CONST_SIZE,
+	.arg4_type      = ARG_PTR_TO_MEM,
+	.arg5_type      = ARG_CONST_SIZE,
+};
+
 bool bpf_helper_changes_pkt_data(void *func)
 {
 	if (func == bpf_skb_vlan_push ||
@@ -4903,6 +4978,8 @@ lwt_seg6local_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 		return &bpf_lwt_seg6_action_proto;
 	case BPF_FUNC_lwt_seg6_adjust_srh:
 		return &bpf_lwt_seg6_adjust_srh_proto;
+	case BPF_FUNC_ipv6_fib_multipath_nh:
+		return &bpf_ipv6_fib_multipath_nh_proto;
 	default:
 		return lwt_out_func_proto(func_id, prog);
 	}
