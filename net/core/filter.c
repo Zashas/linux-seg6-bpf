@@ -4620,6 +4620,29 @@ static const struct bpf_func_proto bpf_ipv6_fib_multipath_nh_proto = {
 	.arg5_type      = ARG_CONST_SIZE,
 };
 
+BPF_CALL_0(bpf_ktime_get_real_ns)
+{
+	return ktime_get_real_ns();
+}
+
+const struct bpf_func_proto bpf_ktime_get_real_ns_proto = {
+	.func		= bpf_ktime_get_real_ns,
+	.gpl_only	= true,
+	.ret_type	= RET_INTEGER,
+};
+
+BPF_CALL_1(bpf_skb_get_tstamp, struct sk_buff *, skb)
+{
+	return skb->tstamp;
+}
+
+static const struct bpf_func_proto bpf_skb_get_tstamp_proto = {
+	.func		= bpf_skb_get_tstamp,
+	.gpl_only	= true,
+	.ret_type	= RET_INTEGER,
+	.arg1_type      = ARG_PTR_TO_CTX,
+};
+
 bool bpf_helper_changes_pkt_data(void *func)
 {
 	if (func == bpf_skb_vlan_push ||
@@ -4980,6 +5003,10 @@ lwt_seg6local_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 		return &bpf_lwt_seg6_adjust_srh_proto;
 	case BPF_FUNC_ipv6_fib_multipath_nh:
 		return &bpf_ipv6_fib_multipath_nh_proto;
+	case BPF_FUNC_ktime_get_real_ns:
+		return &bpf_ktime_get_real_ns_proto;
+	case BPF_FUNC_skb_get_tstamp:
+		return &bpf_skb_get_tstamp_proto;
 	default:
 		return lwt_out_func_proto(func_id, prog);
 	}
