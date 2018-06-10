@@ -466,13 +466,24 @@ static int input_action_end_bpf(struct sk_buff *skb,
 		this_cpu_ptr(&seg6_bpf_srh_states);
 	struct seg6_bpf_srh_state local_srh_state;
 	struct ipv6_sr_hdr *srh;
+	struct ipv6hdr *hdr;
 	int srhoff = 0;
 	int ret;
 
-	srh = get_and_validate_srh(skb);
+	srh = get_srh(skb);
 	if (!srh)
 		goto drop;
-	advance_nextseg(srh, &ipv6_hdr(skb)->daddr);
+
+#ifdef CONFIG_IPV6_SEG6_HMAC
+	if (!seg6_hmac_validate_skb(skb))
+		goto drop;
+#endif
+
+	hdr = ipv6_hdr(skb);
+	if (srh->segments_left == 0)
+		memset(&hdr->daddr, 0, sizeof(hdr->daddr));
+	else
+		advance_nextseg(srh, &ipv6_hdr(skb)->daddr);
 
 	/* preempt_disable is needed to protect the per-CPU buffer srh_state,
 	 * which is also accessed by the bpf_lwt_seg6_* helpers
@@ -480,6 +491,7 @@ static int input_action_end_bpf(struct sk_buff *skb,
 	preempt_disable();
 	srh_state->hdrlen = srh->hdrlen << 3;
 	srh_state->valid = 1;
+	srh_state->none = 0;
 
 	rcu_read_lock();
 	bpf_compute_data_pointers(skb);
@@ -500,6 +512,9 @@ static int input_action_end_bpf(struct sk_buff *skb,
 		goto drop;
 	}
 
+	if (local_srh_state.none)
+		goto lookup;
+
 	if (unlikely((local_srh_state.hdrlen & 7) != 0))
 		goto drop;
 
@@ -512,6 +527,7 @@ static int input_action_end_bpf(struct sk_buff *skb,
 	    unlikely(!seg6_validate_srh(srh, (srh->hdrlen + 1) << 3)))
 		goto drop;
 
+lookup:
 	if (ret != BPF_REDIRECT)
 		seg6_lookup_nexthop(skb, NULL, 0);
 

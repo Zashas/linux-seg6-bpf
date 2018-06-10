@@ -4422,10 +4422,13 @@ BPF_CALL_4(bpf_lwt_seg6_action, struct sk_buff *, skb,
 	   u32, action, void *, param, u32, param_len)
 {
 #if IS_ENABLED(CONFIG_IPV6_SEG6_BPF)
+	//TODO has_srh
+
 	struct seg6_bpf_srh_state *srh_state =
 		this_cpu_ptr(&seg6_bpf_srh_states);
 	struct ipv6_sr_hdr *srh;
 	int srhoff = 0;
+	int hdroff = 0; // merge avec srhoff
 	int err;
 
 	if (ipv6_find_hdr(skb, &srhoff, IPPROTO_ROUTING, NULL, NULL) < 0)
@@ -4466,6 +4469,34 @@ BPF_CALL_4(bpf_lwt_seg6_action, struct sk_buff *, skb,
 			srh_state->hdrlen =
 				((struct ipv6_sr_hdr *)param)->hdrlen << 3;
 		return err;
+	case SEG6_LOCAL_ACTION_END_DT6:
+		if (param_len != sizeof(int))
+			return -EINVAL;
+
+		if (ipv6_find_hdr(skb, &hdroff, IPPROTO_IPV6, NULL, NULL) < 0)
+			return -EBADMSG;
+
+		if (!pskb_pull(skb, hdroff))
+			return -EBADMSG;
+
+		skb_postpull_rcsum(skb, skb_network_header(skb), hdroff);
+
+		skb_reset_network_header(skb);
+		skb_reset_transport_header(skb);
+		skb->encapsulation = 0;
+		bpf_compute_data_pointers(skb);
+
+		// TODO check valid ?
+		srhoff = 0;
+		if (ipv6_find_hdr(skb, &srhoff, IPPROTO_ROUTING, NULL, NULL) < 0) {
+			srh_state->none = 1;
+		} else {
+			srh = (struct ipv6_sr_hdr *)(skb->data + srhoff);
+			srh_state->hdrlen = srh->hdrlen << 3;
+			srh_state->valid = 1;
+		}
+
+		return seg6_lookup_nexthop(skb, NULL, *(int *)param);
 	default:
 		return -EINVAL;
 	}
@@ -4690,6 +4721,11 @@ bpf_base_func_proto(enum bpf_func_id func_id)
 		return &bpf_tail_call_proto;
 	case BPF_FUNC_ktime_get_ns:
 		return &bpf_ktime_get_ns_proto;
+	case BPF_FUNC_ktime_get_real_ns:
+		return &bpf_ktime_get_real_ns_proto;
+	case BPF_FUNC_skb_get_tstamp:
+		return &bpf_skb_get_tstamp_proto;
+
 	case BPF_FUNC_trace_printk:
 		if (capable(CAP_SYS_ADMIN))
 			return bpf_get_trace_printk_proto();
@@ -4940,6 +4976,9 @@ lwt_out_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 		return &bpf_get_smp_processor_id_proto;
 	case BPF_FUNC_skb_under_cgroup:
 		return &bpf_skb_under_cgroup_proto;
+	case BPF_FUNC_lwt_push_encap:
+		return &bpf_lwt_push_encap_proto;
+
 	default:
 		return bpf_base_func_proto(func_id);
 	}
@@ -4987,7 +5026,7 @@ lwt_xmit_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 	case BPF_FUNC_set_hash_invalid:
 		return &bpf_set_hash_invalid_proto;
 	default:
-		return lwt_out_func_proto(func_id, prog);
+		return lwt_in_func_proto(func_id, prog);
 	}
 }
 
@@ -5003,10 +5042,6 @@ lwt_seg6local_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 		return &bpf_lwt_seg6_adjust_srh_proto;
 	case BPF_FUNC_ipv6_fib_multipath_nh:
 		return &bpf_ipv6_fib_multipath_nh_proto;
-	case BPF_FUNC_ktime_get_real_ns:
-		return &bpf_ktime_get_real_ns_proto;
-	case BPF_FUNC_skb_get_tstamp:
-		return &bpf_skb_get_tstamp_proto;
 	default:
 		return lwt_out_func_proto(func_id, prog);
 	}

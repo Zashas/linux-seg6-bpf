@@ -24,6 +24,7 @@ extern int seg6_lookup_nexthop(struct sk_buff *skb, struct in6_addr *nhaddr,
 
 struct seg6_bpf_srh_state {
 	bool valid;
+	bool none;
 	u16 hdrlen;
 };
 
