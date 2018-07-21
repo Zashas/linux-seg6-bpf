@@ -4445,14 +4445,13 @@ BPF_CALL_4(bpf_lwt_seg6_store_bytes, struct sk_buff *, skb, u32, offset,
 #if IS_ENABLED(CONFIG_IPV6_SEG6_BPF)
 	struct seg6_bpf_srh_state *srh_state =
 		this_cpu_ptr(&seg6_bpf_srh_states);
+	struct ipv6_sr_hdr *srh = srh_state->srh;
 	void *srh_tlvs, *srh_end, *ptr;
-	struct ipv6_sr_hdr *srh;
 	int srhoff = 0;
 
-	if (ipv6_find_hdr(skb, &srhoff, IPPROTO_ROUTING, NULL, NULL) < 0)
+	if (srh == NULL)
 		return -EINVAL;
 
-	srh = (struct ipv6_sr_hdr *)(skb->data + srhoff);
 	srh_tlvs = (void *)((char *)srh + ((srh->first_segment + 1) << 4));
 	srh_end = (void *)((char *)srh + sizeof(*srh) + srh_state->hdrlen);
 
@@ -4465,6 +4464,9 @@ BPF_CALL_4(bpf_lwt_seg6_store_bytes, struct sk_buff *, skb, u32, offset,
 
 	if (unlikely(bpf_try_make_writable(skb, offset + len)))
 		return -EFAULT;
+	if (ipv6_find_hdr(skb, &srhoff, IPPROTO_ROUTING, NULL, NULL) < 0)
+		return -EINVAL;
+	srh_state->srh = (struct ipv6_sr_hdr *)(skb->data + srhoff);
 
 	memcpy(skb->data + offset, from, len);
 	return 0;
@@ -4483,37 +4485,61 @@ static const struct bpf_func_proto bpf_lwt_seg6_store_bytes_proto = {
 	.arg4_type	= ARG_CONST_SIZE
 };
 
-BPF_CALL_4(bpf_lwt_seg6_action, struct sk_buff *, skb,
-	   u32, action, void *, param, u32, param_len)
+static void bpf_update_srh_state(struct sk_buff *skb)
 {
-#if IS_ENABLED(CONFIG_IPV6_SEG6_BPF)
 	struct seg6_bpf_srh_state *srh_state =
 		this_cpu_ptr(&seg6_bpf_srh_states);
-	struct ipv6_sr_hdr *srh;
 	int srhoff = 0;
-	int err;
 
-	if (ipv6_find_hdr(skb, &srhoff, IPPROTO_ROUTING, NULL, NULL) < 0)
-		return -EINVAL;
-	srh = (struct ipv6_sr_hdr *)(skb->data + srhoff);
+	if (ipv6_find_hdr(skb, &srhoff, IPPROTO_ROUTING, NULL, NULL) < 0) {
+		srh_state->srh = NULL;
+	} else {
+		srh_state->srh = (struct ipv6_sr_hdr *)(skb->data + srhoff);
+		srh_state->hdrlen = srh_state->srh->hdrlen << 3;
+		srh_state->valid = 1;
+	}
+}
+
+static bool bpf_skb_has_valid_srh(struct sk_buff *skb)
+{
+	struct seg6_bpf_srh_state *srh_state =
+		this_cpu_ptr(&seg6_bpf_srh_states);
+	struct ipv6_sr_hdr *srh = srh_state->srh;
+
+	if (srh == NULL)
+		return false;
 
 	if (!srh_state->valid) {
 		if (unlikely((srh_state->hdrlen & 7) != 0))
-			return -EBADMSG;
+			return false;
 
 		srh->hdrlen = (u8)(srh_state->hdrlen >> 3);
 		if (unlikely(!seg6_validate_srh(srh, (srh->hdrlen + 1) << 3)))
-			return -EBADMSG;
+			return false;
 
 		srh_state->valid = 1;
 	}
 
+	return true;
+}
+
+BPF_CALL_4(bpf_lwt_seg6_action, struct sk_buff *, skb,
+	   u32, action, void *, param, u32, param_len)
+{
+#if IS_ENABLED(CONFIG_IPV6_SEG6_BPF)
+	int hdroff = 0;
+	int err;
+
 	switch (action) {
 	case SEG6_LOCAL_ACTION_END_X:
+		if (!bpf_skb_has_valid_srh(skb))
+			return -EBADMSG;
 		if (param_len != sizeof(struct in6_addr))
 			return -EINVAL;
 		return seg6_lookup_nexthop(skb, (struct in6_addr *)param, 0);
 	case SEG6_LOCAL_ACTION_END_T:
+		if (!bpf_skb_has_valid_srh(skb))
+			return -EBADMSG;
 		if (param_len != sizeof(int))
 			return -EINVAL;
 		return seg6_lookup_nexthop(skb, NULL, *(int *)param);
@@ -4521,16 +4547,34 @@ BPF_CALL_4(bpf_lwt_seg6_action, struct sk_buff *, skb,
 		err = bpf_push_seg6_encap(skb, BPF_LWT_ENCAP_SEG6_INLINE,
 					  param, param_len);
 		if (!err)
-			srh_state->hdrlen =
-				((struct ipv6_sr_hdr *)param)->hdrlen << 3;
+			bpf_update_srh_state(skb);
+
 		return err;
 	case SEG6_LOCAL_ACTION_END_B6_ENCAP:
 		err = bpf_push_seg6_encap(skb, BPF_LWT_ENCAP_SEG6,
 					  param, param_len);
 		if (!err)
-			srh_state->hdrlen =
-				((struct ipv6_sr_hdr *)param)->hdrlen << 3;
+			bpf_update_srh_state(skb);
+
 		return err;
+	case SEG6_LOCAL_ACTION_END_DT6:
+		if (param_len != sizeof(int))
+			return -EINVAL;
+
+		// find inner IPv6 header, pull outer IPv6 header
+		if (ipv6_find_hdr(skb, &hdroff, IPPROTO_IPV6, NULL, NULL) < 0)
+			return -EBADMSG;
+		if (!pskb_pull(skb, hdroff))
+			return -EBADMSG;
+
+		skb_postpull_rcsum(skb, skb_network_header(skb), hdroff);
+		skb_reset_network_header(skb);
+		skb_reset_transport_header(skb);
+		skb->encapsulation = 0;
+
+		bpf_compute_data_pointers(skb);
+		bpf_update_srh_state(skb);
+		return seg6_lookup_nexthop(skb, NULL, *(int *)param);
 	default:
 		return -EINVAL;
 	}
@@ -4555,15 +4599,14 @@ BPF_CALL_3(bpf_lwt_seg6_adjust_srh, struct sk_buff *, skb, u32, offset,
 #if IS_ENABLED(CONFIG_IPV6_SEG6_BPF)
 	struct seg6_bpf_srh_state *srh_state =
 		this_cpu_ptr(&seg6_bpf_srh_states);
+	struct ipv6_sr_hdr *srh = srh_state->srh;
 	void *srh_end, *srh_tlvs, *ptr;
-	struct ipv6_sr_hdr *srh;
 	struct ipv6hdr *hdr;
 	int srhoff = 0;
 	int ret;
 
-	if (ipv6_find_hdr(skb, &srhoff, IPPROTO_ROUTING, NULL, NULL) < 0)
+	if (srh == NULL)
 		return -EINVAL;
-	srh = (struct ipv6_sr_hdr *)(skb->data + srhoff);
 
 	srh_tlvs = (void *)((unsigned char *)srh + sizeof(*srh) +
 			((srh->first_segment + 1) << 4));
@@ -4593,6 +4636,9 @@ BPF_CALL_3(bpf_lwt_seg6_adjust_srh, struct sk_buff *, skb, u32, offset,
 	hdr = (struct ipv6hdr *)skb->data;
 	hdr->payload_len = htons(skb->len - sizeof(struct ipv6hdr));
 
+	if (ipv6_find_hdr(skb, &srhoff, IPPROTO_ROUTING, NULL, NULL) < 0)
+		return -EINVAL;
+	srh_state->srh = (struct ipv6_sr_hdr *)(skb->data + srhoff);
 	srh_state->hdrlen += len;
 	srh_state->valid = 0;
 	return 0;

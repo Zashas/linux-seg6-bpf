@@ -466,7 +466,6 @@ static int input_action_end_bpf(struct sk_buff *skb,
 		this_cpu_ptr(&seg6_bpf_srh_states);
 	struct seg6_bpf_srh_state local_srh_state;
 	struct ipv6_sr_hdr *srh;
-	int srhoff = 0;
 	int ret;
 
 	srh = get_and_validate_srh(skb);
@@ -478,6 +477,7 @@ static int input_action_end_bpf(struct sk_buff *skb,
 	 * which is also accessed by the bpf_lwt_seg6_* helpers
 	 */
 	preempt_disable();
+	srh_state->srh = srh;
 	srh_state->hdrlen = srh->hdrlen << 3;
 	srh_state->valid = 1;
 
@@ -500,17 +500,17 @@ static int input_action_end_bpf(struct sk_buff *skb,
 		goto drop;
 	}
 
-	if (unlikely((local_srh_state.hdrlen & 7) != 0))
-		goto drop;
+	if (local_srh_state.srh != NULL) {
+		srh = local_srh_state.srh;
+		if (unlikely((local_srh_state.hdrlen & 7) != 0))
+			goto drop;
 
-	if (ipv6_find_hdr(skb, &srhoff, IPPROTO_ROUTING, NULL, NULL) < 0)
-		goto drop;
-	srh = (struct ipv6_sr_hdr *)(skb->data + srhoff);
-	srh->hdrlen = (u8)(local_srh_state.hdrlen >> 3);
+		srh->hdrlen = (u8)(local_srh_state.hdrlen >> 3);
 
-	if (!local_srh_state.valid &&
-	    unlikely(!seg6_validate_srh(srh, (srh->hdrlen + 1) << 3)))
-		goto drop;
+		if (!local_srh_state.valid &&
+		    unlikely(!seg6_validate_srh(srh, (srh->hdrlen + 1) << 3)))
+			goto drop;
+	}
 
 	if (ret != BPF_REDIRECT)
 		seg6_lookup_nexthop(skb, NULL, 0);
