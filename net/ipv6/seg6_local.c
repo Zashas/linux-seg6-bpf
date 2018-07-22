@@ -40,6 +40,7 @@ struct seg6_local_lwt;
 struct seg6_action_desc {
 	int action;
 	unsigned long attrs;
+	unsigned long opt_attrs;
 	int (*input)(struct sk_buff *skb, struct seg6_local_lwt *slwt);
 	int static_headroom;
 };
@@ -57,7 +58,8 @@ struct seg6_local_lwt {
 	struct in6_addr nh6;
 	int iif;
 	int oif;
-	struct bpf_lwt_prog bpf;
+	struct bpf_lwt_prog bpf_endpoint;
+	struct bpf_lwt_prog bpf_ultimate;
 
 	int headroom;
 	struct seg6_action_desc *desc;
@@ -465,13 +467,27 @@ static int input_action_end_bpf(struct sk_buff *skb,
 	struct seg6_bpf_srh_state *srh_state =
 		this_cpu_ptr(&seg6_bpf_srh_states);
 	struct seg6_bpf_srh_state local_srh_state;
+	struct bpf_prog *prog = NULL;
 	struct ipv6_sr_hdr *srh;
 	int ret;
 
-	srh = get_and_validate_srh(skb);
+	srh = get_srh(skb);
 	if (!srh)
 		goto drop;
-	advance_nextseg(srh, &ipv6_hdr(skb)->daddr);
+
+#ifdef CONFIG_IPV6_SEG6_HMAC
+	if (!seg6_hmac_validate_skb(skb))
+		goto drop;
+#endif
+
+	if (srh->segments_left > 0 && slwt->bpf_endpoint.prog) {
+		advance_nextseg(srh, &ipv6_hdr(skb)->daddr);
+		prog = slwt->bpf_endpoint.prog;
+	} else if (srh->segments_left == 0 && slwt->bpf_ultimate.prog) {
+		prog = slwt->bpf_ultimate.prog;
+	} else {
+		goto drop;
+	}
 
 	/* preempt_disable is needed to protect the per-CPU buffer srh_state,
 	 * which is also accessed by the bpf_lwt_seg6_* helpers
@@ -483,7 +499,7 @@ static int input_action_end_bpf(struct sk_buff *skb,
 
 	rcu_read_lock();
 	bpf_compute_data_pointers(skb);
-	ret = bpf_prog_run_save_cb(slwt->bpf.prog, skb);
+	ret = bpf_prog_run_save_cb(prog, skb);
 	rcu_read_unlock();
 
 	local_srh_state = *srh_state;
@@ -571,7 +587,9 @@ static struct seg6_action_desc seg6_action_table[] = {
 	},
 	{
 		.action		= SEG6_LOCAL_ACTION_END_BPF,
-		.attrs		= (1 << SEG6_LOCAL_BPF),
+		.attrs		= 0,
+		.opt_attrs	= (1 << SEG6_LOCAL_BPF) |
+				  (1 << SEG6_LOCAL_BPF_ULTIM),
 		.input		= input_action_end_bpf,
 	},
 
@@ -620,6 +638,7 @@ static const struct nla_policy seg6_local_policy[SEG6_LOCAL_MAX + 1] = {
 	[SEG6_LOCAL_IIF]	= { .type = NLA_U32 },
 	[SEG6_LOCAL_OIF]	= { .type = NLA_U32 },
 	[SEG6_LOCAL_BPF]	= { .type = NLA_NESTED },
+	[SEG6_LOCAL_BPF_ULTIM]	= { .type = NLA_NESTED },
 };
 
 static int parse_nla_srh(struct nlattr **attrs, struct seg6_local_lwt *slwt)
@@ -804,7 +823,7 @@ static const struct nla_policy bpf_prog_policy[SEG6_LOCAL_BPF_PROG_MAX + 1] = {
 				       .len = MAX_PROG_NAME },
 };
 
-static int parse_nla_bpf(struct nlattr **attrs, struct seg6_local_lwt *slwt)
+static int parse_nla_bpf_prog(struct nlattr **attrs, struct bpf_lwt_prog *lwt_prog, int bpf_attr)
 {
 	struct nlattr *tb[SEG6_LOCAL_BPF_PROG_MAX + 1];
 	struct bpf_prog *p;
@@ -812,59 +831,91 @@ static int parse_nla_bpf(struct nlattr **attrs, struct seg6_local_lwt *slwt)
 	u32 fd;
 
 	ret = nla_parse_nested(tb, SEG6_LOCAL_BPF_PROG_MAX,
-			       attrs[SEG6_LOCAL_BPF], bpf_prog_policy, NULL);
+			       attrs[bpf_attr], bpf_prog_policy, NULL);
 	if (ret < 0)
 		return ret;
 
 	if (!tb[SEG6_LOCAL_BPF_PROG] || !tb[SEG6_LOCAL_BPF_PROG_NAME])
 		return -EINVAL;
 
-	slwt->bpf.name = nla_memdup(tb[SEG6_LOCAL_BPF_PROG_NAME], GFP_KERNEL);
-	if (!slwt->bpf.name)
+	lwt_prog->name = nla_memdup(tb[SEG6_LOCAL_BPF_PROG_NAME], GFP_KERNEL);
+	if (!lwt_prog->name)
 		return -ENOMEM;
 
 	fd = nla_get_u32(tb[SEG6_LOCAL_BPF_PROG]);
 	p = bpf_prog_get_type(fd, BPF_PROG_TYPE_LWT_SEG6LOCAL);
 	if (IS_ERR(p)) {
-		kfree(slwt->bpf.name);
+		kfree(lwt_prog->name);
 		return PTR_ERR(p);
 	}
 
-	slwt->bpf.prog = p;
+	lwt_prog->prog = p;
 	return 0;
 }
 
-static int put_nla_bpf(struct sk_buff *skb, struct seg6_local_lwt *slwt)
+static int parse_nla_bpf_endpoint(struct nlattr **attrs, struct seg6_local_lwt *slwt)
+{
+	return parse_nla_bpf_prog(attrs, &slwt->bpf_endpoint, SEG6_LOCAL_BPF);
+}
+
+static int parse_nla_bpf_ultimate(struct nlattr **attrs, struct seg6_local_lwt *slwt)
+{
+	return parse_nla_bpf_prog(attrs, &slwt->bpf_ultimate, SEG6_LOCAL_BPF_ULTIM);
+}
+
+static int put_nla_bpf_prog(struct sk_buff *skb, struct bpf_lwt_prog *lwt_prog, int attr)
 {
 	struct nlattr *nest;
 
-	if (!slwt->bpf.prog)
+	if (!lwt_prog->prog)
 		return 0;
 
-	nest = nla_nest_start(skb, SEG6_LOCAL_BPF);
+	nest = nla_nest_start(skb, attr);
 	if (!nest)
 		return -EMSGSIZE;
 
-	if (nla_put_u32(skb, SEG6_LOCAL_BPF_PROG, slwt->bpf.prog->aux->id))
+	if (nla_put_u32(skb, SEG6_LOCAL_BPF_PROG, lwt_prog->prog->aux->id))
 		return -EMSGSIZE;
 
-	if (slwt->bpf.name &&
-	    nla_put_string(skb, SEG6_LOCAL_BPF_PROG_NAME, slwt->bpf.name))
+	if (lwt_prog->name &&
+	    nla_put_string(skb, SEG6_LOCAL_BPF_PROG_NAME, lwt_prog->name))
 		return -EMSGSIZE;
 
 	return nla_nest_end(skb, nest);
 }
 
-static int cmp_nla_bpf(struct seg6_local_lwt *a, struct seg6_local_lwt *b)
+static int put_nla_bpf_endpoint(struct sk_buff *skb, struct seg6_local_lwt *slwt)
 {
-	if (!a->bpf.name && !b->bpf.name)
+	return put_nla_bpf_prog(skb, &slwt->bpf_endpoint, SEG6_LOCAL_BPF);
+}
+
+static int put_nla_bpf_ultimate(struct sk_buff *skb, struct seg6_local_lwt *slwt)
+{
+	return put_nla_bpf_prog(skb, &slwt->bpf_ultimate, SEG6_LOCAL_BPF_ULTIM);
+}
+
+static int cmp_nla_bpf_endpoint(struct seg6_local_lwt *a, struct seg6_local_lwt *b)
+{
+	if (!a->bpf_endpoint.name && !b->bpf_endpoint.name)
 		return 0;
 
-	if (!a->bpf.name || !b->bpf.name)
+	if (!a->bpf_endpoint.name || !b->bpf_endpoint.name)
 		return 1;
 
-	return strcmp(a->bpf.name, b->bpf.name);
+	return strcmp(a->bpf_endpoint.name, b->bpf_endpoint.name);
 }
+
+static int cmp_nla_bpf_ultimate(struct seg6_local_lwt *a, struct seg6_local_lwt *b)
+{
+	if (!a->bpf_ultimate.name && !b->bpf_ultimate.name)
+		return 0;
+
+	if (!a->bpf_ultimate.name || !b->bpf_ultimate.name)
+		return 1;
+
+	return strcmp(a->bpf_ultimate.name, b->bpf_ultimate.name);
+}
+
 
 struct seg6_action_param {
 	int (*parse)(struct nlattr **attrs, struct seg6_local_lwt *slwt);
@@ -897,10 +948,13 @@ static struct seg6_action_param seg6_action_params[SEG6_LOCAL_MAX + 1] = {
 				    .put = put_nla_oif,
 				    .cmp = cmp_nla_oif },
 
-	[SEG6_LOCAL_BPF]	= { .parse = parse_nla_bpf,
-				    .put = put_nla_bpf,
-				    .cmp = cmp_nla_bpf },
+	[SEG6_LOCAL_BPF]	= { .parse = parse_nla_bpf_endpoint,
+				    .put = put_nla_bpf_endpoint,
+				    .cmp = cmp_nla_bpf_endpoint },
 
+	[SEG6_LOCAL_BPF_ULTIM]	= { .parse = parse_nla_bpf_ultimate,
+				    .put = put_nla_bpf_ultimate,
+				    .cmp = cmp_nla_bpf_ultimate },
 };
 
 static int parse_nla_action(struct nlattr **attrs, struct seg6_local_lwt *slwt)
@@ -920,15 +974,16 @@ static int parse_nla_action(struct nlattr **attrs, struct seg6_local_lwt *slwt)
 	slwt->headroom += desc->static_headroom;
 
 	for (i = 0; i < SEG6_LOCAL_MAX + 1; i++) {
-		if (desc->attrs & (1 << i)) {
-			if (!attrs[i])
+		if ((desc->attrs | desc->opt_attrs) & (1 << i)) {
+			if (desc->attrs & (1 << i) && !attrs[i]) {
 				return -EINVAL;
+			} else if (attrs[i]) {
+				param = &seg6_action_params[i];
 
-			param = &seg6_action_params[i];
-
-			err = param->parse(attrs, slwt);
-			if (err < 0)
-				return err;
+				err = param->parse(attrs, slwt);
+				if (err < 0)
+					return err;
+			}
 		}
 	}
 
@@ -987,9 +1042,13 @@ static void seg6_local_destroy_state(struct lwtunnel_state *lwt)
 
 	kfree(slwt->srh);
 
-	if (slwt->desc->attrs & (1 << SEG6_LOCAL_BPF)) {
-		kfree(slwt->bpf.name);
-		bpf_prog_put(slwt->bpf.prog);
+	if (slwt->desc->opt_attrs & (1 << SEG6_LOCAL_BPF)) {
+		kfree(slwt->bpf_endpoint.name);
+		bpf_prog_put(slwt->bpf_endpoint.prog);
+	}
+	if (slwt->desc->opt_attrs & (1 << SEG6_LOCAL_BPF_ULTIM)) {
+		kfree(slwt->bpf_ultimate.name);
+		bpf_prog_put(slwt->bpf_ultimate.prog);
 	}
 
 	return;
@@ -1006,7 +1065,7 @@ static int seg6_local_fill_encap(struct sk_buff *skb,
 		return -EMSGSIZE;
 
 	for (i = 0; i < SEG6_LOCAL_MAX + 1; i++) {
-		if (slwt->desc->attrs & (1 << i)) {
+		if ((slwt->desc->attrs | slwt->desc->opt_attrs) & (1 << i)) {
 			param = &seg6_action_params[i];
 			err = param->put(skb, slwt);
 			if (err < 0)
@@ -1025,7 +1084,7 @@ static int seg6_local_get_encap_size(struct lwtunnel_state *lwt)
 
 	nlsize = nla_total_size(4); /* action */
 
-	attrs = slwt->desc->attrs;
+	attrs = slwt->desc->attrs | slwt->desc->opt_attrs;
 
 	if (attrs & (1 << SEG6_LOCAL_SRH))
 		nlsize += nla_total_size((slwt->srh->hdrlen + 1) << 3);
@@ -1050,6 +1109,11 @@ static int seg6_local_get_encap_size(struct lwtunnel_state *lwt)
 		       nla_total_size(MAX_PROG_NAME) +
 		       nla_total_size(4);
 
+	if (attrs & (1 << SEG6_LOCAL_BPF_ULTIM))
+		nlsize += nla_total_size(sizeof(struct nlattr)) +
+		       nla_total_size(MAX_PROG_NAME) +
+		       nla_total_size(4);
+
 	return nlsize;
 }
 
@@ -1069,8 +1133,12 @@ static int seg6_local_cmp_encap(struct lwtunnel_state *a,
 	if (slwt_a->desc->attrs != slwt_b->desc->attrs)
 		return 1;
 
+	if (slwt_a->desc->opt_attrs != slwt_b->desc->opt_attrs)
+		return 1;
+
 	for (i = 0; i < SEG6_LOCAL_MAX + 1; i++) {
-		if (slwt_a->desc->attrs & (1 << i)) {
+		if ((slwt_a->desc->attrs | slwt_a->desc->opt_attrs) & (1 << i))
+		{
 			param = &seg6_action_params[i];
 			if (param->cmp(slwt_a, slwt_b))
 				return 1;
